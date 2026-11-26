@@ -195,6 +195,7 @@ def profile_posts(profile_urls: list[str], since: dt.date, max_posts: int = 10, 
         left = credit_left()
         if left is None:
             left = budget() - spent_this_month()
+        left = round(left - 0.25, 4)  # Apify reports usage about one chunk late -> keep a safety margin
         if left < cap:  # not enough for the whole chunk -> as many profiles as the credit allows
             part = part[:int(max(0.0, left - 0.02 - POSTS_START_USD) / (POST_USD * max_posts))]
             if not part:
