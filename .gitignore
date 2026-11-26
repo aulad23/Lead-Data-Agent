@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+data/cache.sqlite
+data/memory/
+data/apify_cache.json
+output/
+outbox/
+inbox/done/
+.env
+reference/
+LinkedIn-Pet-Institute/
