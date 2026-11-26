@@ -9,6 +9,8 @@ articles), then opens each post page for its comment count.
   python -m lead_agent influencer file.xlsx --days 30                         # only posts of the last 30 days
   python -m lead_agent influencer file.xlsx --days 0                          # every post found, any age
   python -m lead_agent influencer file.xlsx --apify                           # + Apify for profiles the free pass misses
+  python -m lead_agent influencer file.xlsx --sheet Influencers --apify --skip-free   # big list: Apify only, one sheet
+Person profiles (linkedin.com/in/) and company pages (linkedin.com/company/) are both read; company pages via Apify only.
 
 --apify: a profile with fewer than --apify-min (3) recent posts from the free pass gets its posts from Apify
 (harvestapi/linkedin-profile-posts, no login, $0.002 per post, free plan $5/month; monthly cap APIFY_MONTHLY_USD
@@ -38,6 +40,8 @@ from lead_agent.connectors.duckduckgo import _ddg
 OUT = OUTPUT_DIR
 MAX_TEXT = 32000  # Excel cell limit is 32767 characters
 PROFILE_RX = re.compile(r"https?://(?:\w+\.)?linkedin\.com/in/([^/?#\s]+)", re.I)
+PAGE_RX = re.compile(r"https?://(?:\w+\.)?linkedin\.com/(in|company)/([^/?#\s]+)", re.I)  # person or company page
+KEEP_COLS = ("Department", "Type", "ATS fit", "Niche", "Country")  # input columns copied to the output if present
 
 
 def _slug(url: str) -> str:
@@ -116,28 +120,38 @@ def _recent(posts: list[dict], since: dt.date | None) -> list[dict]:
 
 
 def run(path: str, limit: int | None = None, post_pages: bool = True, days: int = 60,
-        use_apify: bool = False, apify_min: int = 3, max_posts: int = 10) -> Path:
+        use_apify: bool = False, apify_min: int = 3, max_posts: int = 10,
+        sheet_names: list[str] | None = None, skip_free: bool = False) -> Path:
     t0 = time.time()
     src = Path(path)
     sheets = pd.read_excel(src, sheet_name=None, dtype=str) if src.suffix.lower() != ".csv" else {"csv": pd.read_csv(src, dtype=str)}
+    if sheet_names:
+        want = {x.strip().lower() for x in sheet_names}
+        sheets = {k: v for k, v in sheets.items() if k.strip().lower() in want}
+        if not sheets:
+            raise SystemExit(f"[influencer] no sheet named {sheet_names} in {src.name}")
     people = []
     for sheet, df in sheets.items():
         df = df.fillna("")
-        cols = [c for c in df.columns if df[c].str.contains(r"linkedin\.com/in/", case=False).any()]
+        cols = [c for c in df.columns if df[c].str.contains(r"linkedin\.com/(?:in|company)/", case=False).any()]
         if not cols:
             continue
-        name_col = next((c for c in df.columns if str(c).strip().lower() in ("name", "full name", "influencer")), None)
+        name_col = next((c for c in df.columns if str(c).strip().lower() in
+                         ("name", "full name", "influencer", "competitor", "company")), None)
         foll_col = next((c for c in df.columns if "linkedin" in str(c).lower() and "follow" in str(c).lower()), None)
+        keep = [c for c in KEEP_COLS if c in df.columns]
         for _, r in df.iterrows():
-            m = PROFILE_RX.search(str(r[cols[0]]))
+            m = PAGE_RX.search(str(r[cols[0]]))
             if m:
-                people.append({"sheet": sheet, "name": r[name_col] if name_col else m.group(1),
-                               "profile": f"https://www.linkedin.com/in/{m.group(1)}/",
-                               "followers": r[foll_col] if foll_col else ""})
+                kind = m.group(1).lower()
+                people.append({"sheet": sheet, "name": r[name_col] if name_col else m.group(2),
+                               "profile": f"https://www.linkedin.com/{kind}/{m.group(2)}/",
+                               "followers": r[foll_col] if foll_col else "", "extra": {c: r[c] for c in keep}})
     seen, uniq = set(), []
     for p in people:
-        if p["profile"] not in seen:
-            seen.add(p["profile"])
+        k = p["profile"].lower()
+        if k not in seen:
+            seen.add(k)
             uniq.append(p)
     people = uniq[:limit] if limit else uniq
     rows, summary, today = [], [], dt.date.today()
@@ -147,6 +161,10 @@ def run(path: str, limit: int | None = None, post_pages: bool = True, days: int 
 
     res = []  # free pass: public profile page or search engine
     for i, p in enumerate(people, 1):
+        if skip_free or "/company/" in p["profile"]:  # free pass reads person profiles only
+            res.append({"p": p, "posts": [], "status": "free pass skipped" if skip_free else "company page",
+                        "dates": [], "dropped": 0})
+            continue
         posts, status = profile_posts(p["profile"], since)
         if post_pages:
             for x in posts:
@@ -178,8 +196,10 @@ def run(path: str, limit: int | None = None, post_pages: bool = True, days: int 
                                   max_posts, log=print)
         for r in weak:
             ap = got.get(apify._slug(r["p"]["profile"]))
-            if ap is None:
-                continue  # skipped (budget / error) -> keep the free result
+            if ap is None:  # skipped (credit / error) -> keep the free result
+                if not r["posts"] and r["status"] in ("free pass skipped", "company page"):
+                    r["status"] = "pending - Apify credit (run again with a new key)"
+                continue
             if len(ap) >= len(r["posts"]):
                 r["posts"] = [{**x, "text": x["text"][:MAX_TEXT], "via": "apify"} for x in ap]
                 r["status"] = "ok (apify)" if ap else f"no posts in {days}d (apify)"
@@ -195,20 +215,21 @@ def run(path: str, limit: int | None = None, post_pages: bool = True, days: int 
         for n, x in enumerate(sorted(posts, key=lambda x: x["date"] or "", reverse=True), 1):
             com = int(x["comments"]) if str(x["comments"]).isdigit() else None
             eng = x["likes"] + (com or 0)
-            rows.append({"influencer": p["name"], "post_no": n, "date": x["date"], "type": x["type"], "content": x["text"],
+            rows.append({"influencer": p["name"], **p["extra"], "post_no": n, "date": x["date"], "type": x["type"], "content": x["text"],
                          "likes": x["likes"], "comments": com if com is not None else "", "shares": x.get("shares", ""),
                          "total_engagement": eng, "followers": p["followers"],
                          "engagement_rate_%": round(eng / foll * 100, 3) if foll else "",
                          "post_url": x["url"], "found_via": x["via"], "profile": p["profile"]})
         feed = [x for x in posts if x["type"] == "post"]
         recent = [x for x in posts if x["date"] and (today - dt.date.fromisoformat(x["date"][:10])).days <= 30]
-        summary.append({"influencer": p["name"], "profile": p["profile"], "followers": p["followers"], "status": status,
+        summary.append({"influencer": p["name"], **p["extra"], "profile": p["profile"], "followers": p["followers"], "status": status,
                         "posts_found": len(feed), "articles_found": len(posts) - len(feed),
                         "older_dropped": r["dropped"],
                         "last_post": dates[0] if dates else "", "posts_last_30d": len(recent)})
 
     OUT.mkdir(exist_ok=True)
-    out = OUT / f"influencer-posts-{today}.xlsx"
+    tag = "-".join(re.sub(r"\W+", "", k).lower() for k in sheets) if sheet_names else ""
+    out = OUT / f"influencer-posts-{tag + '-' if tag else ''}{today}.xlsx"
     from openpyxl.styles import Alignment, Font
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         pd.DataFrame(rows).to_excel(xw, sheet_name="posts", index=False)  # one row per post, newest first per person
@@ -239,8 +260,11 @@ def main():
                     help="profiles with too few recent posts -> Apify (free $5/month credit, $0.002 per post, capped)")
     ap.add_argument("--apify-min", type=int, default=3, help="use Apify when the free pass found fewer posts (default 3)")
     ap.add_argument("--max-posts", type=int, default=10, help="max posts per profile from Apify (default 10)")
+    ap.add_argument("--sheet", action="append", help="only this sheet (repeatable), e.g. --sheet Influencers")
+    ap.add_argument("--skip-free", action="store_true",
+                    help="skip the slow free pass, every profile goes to Apify (use with --apify on big lists)")
     a = ap.parse_args()
-    run(a.file, a.limit, not a.no_post_pages, a.days, a.apify, a.apify_min, a.max_posts)
+    run(a.file, a.limit, not a.no_post_pages, a.days, a.apify, a.apify_min, a.max_posts, a.sheet, a.skip_free)
 
 
 if __name__ == "__main__":

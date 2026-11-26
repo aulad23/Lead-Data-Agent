@@ -135,9 +135,29 @@ def company_employees(company_url: str, max_people: int = 10, log=print) -> list
     return people
 
 
+def credit_left() -> float | None:
+    """USD left on the Apify account of the CURRENT token (real numbers from Apify, so a new key starts fresh).
+    None when Apify does not answer."""
+    try:
+        d = requests.get(f"{API}/users/me/limits", headers={"Authorization": f"Bearer {os.environ['APIFY_TOKEN']}"},
+                         timeout=30).json()["data"]
+        return round(float(d["limits"]["maxMonthlyUsageUsd"]) - float(d["current"]["monthlyUsageUsd"]), 4)
+    except (requests.RequestException, KeyError, ValueError, TypeError):
+        return None
+
+
 def _slug(url: str) -> str:
+    """Cache key of a profile ("name") or company page ("company:name")."""
     u = (url or "").lower().split("?")[0].rstrip("/")
-    return u.split("/in/")[1].split("/")[0] if "/in/" in u else ""
+    if "/in/" in u:
+        return u.split("/in/")[1].split("/")[0]
+    if "/company/" in u:
+        return "company:" + u.split("/company/")[1].split("/")[0]
+    return ""
+
+
+def _target(k: str) -> str:
+    return f"https://www.linkedin.com/company/{k[8:]}/" if k.startswith("company:") else f"https://www.linkedin.com/in/{k}/"
 
 
 def _post(it: dict) -> dict:
@@ -149,10 +169,12 @@ def _post(it: dict) -> dict:
             "url": (it.get("linkedinUrl") or "").split("?")[0]}
 
 
-def profile_posts(profile_urls: list[str], since: dt.date, max_posts: int = 10, log=print) -> dict[str, list[dict]]:
-    """Own posts (no reposts) of LinkedIn profiles published on/after `since`, newest first, max `max_posts` each.
-    One Apify run for all uncached profiles. Returns {profile slug: [posts]}; profiles skipped (budget, error) are
-    missing from the result. Results, also empty ones, are cached POSTS_CACHE_DAYS days -> never paid twice."""
+def profile_posts(profile_urls: list[str], since: dt.date, max_posts: int = 10, log=print,
+                  chunk: int = 25) -> dict[str, list[dict]]:
+    """Own posts (no reposts) of LinkedIn profiles / company pages published on/after `since`, newest first,
+    max `max_posts` each. Runs Apify in chunks of `chunk` profiles; every chunk is cached right away
+    (POSTS_CACHE_DAYS), so a stop (credit finished, error) loses nothing and a re-run continues where it stopped.
+    Returns {cache key: [posts]}; profiles not done (credit / error) are missing from the result."""
     if not available():
         return {}
     s, today = _load(), dt.date.today()
@@ -162,44 +184,60 @@ def profile_posts(profile_urls: list[str], since: dt.date, max_posts: int = 10, 
         c = cache.get(k)
         if c and (today - dt.date.fromisoformat(c["date"])).days < POSTS_CACHE_DAYS and c.get("since", "") <= str(since):
             out[k] = [x for x in c["posts"] if x["date"] >= str(since)]
-        elif k:
+        elif k and k not in todo:
             todo.append(k)
-    if not todo:
-        return out
-    n = len(todo) * max_posts
-    cap = max(0.05, round(POSTS_START_USD + POST_USD * n + 0.01, 3))
-    if _left() < cap:  # not enough for all -> as many profiles as the budget allows
-        todo = todo[:int(max(0.0, _left() - 0.01 - POSTS_START_USD) / (POST_USD * max_posts))]
-        if not todo:
-            log(f"[apify] budget reached ({spent_this_month():.2f}/{budget():.2f} USD this month) -> skipped")
-            return out
-        n = len(todo) * max_posts
+    if out:
+        log(f"[apify] {len(out)} profiles from cache (no cost)")
+    for i in range(0, len(todo), chunk):
+        part = todo[i:i + chunk]
+        n = len(part) * max_posts
         cap = max(0.05, round(POSTS_START_USD + POST_USD * n + 0.01, 3))
-    body = {"targetUrls": [f"https://www.linkedin.com/in/{k}/" for k in todo], "maxPosts": max_posts,
-            "postedLimitDate": str(since), "includeReposts": False, "includeQuotePosts": True,
-            "scrapeReactions": False, "scrapeComments": False}
-    log(f"[apify] recent posts of {len(todo)} profiles (max {max_posts} each, since {since}), cap ${cap:.2f}")
-    try:
-        run, items = _run(POSTS_ACTOR, body, cap, n)
-    except (requests.RequestException, KeyError, ValueError) as e:
-        log(f"[apify] failed: {e}")
-        return out
-    got = {k: [] for k in todo}
-    for it in items:
-        if not isinstance(it, dict) or it.get("type", "post") != "post":
-            continue
-        k = _slug((it.get("query") or {}).get("targetUrl", "")) or ((it.get("author") or {}).get("publicIdentifier") or "").lower()
-        if k in got:
-            got[k].append(_post(it))
-    posts_n = sum(len(v) for v in got.values())
-    cost = round(max(float(run.get("usageTotalUsd") or 0), POSTS_START_USD + POST_USD * posts_n), 4)
-    _charge(cost)
-    s = _load()
-    for k, v in got.items():
-        v.sort(key=lambda x: x["date"], reverse=True)
-        s.setdefault("profiles", {})[k] = {"date": today.isoformat(), "since": str(since), "posts": v}
-        out[k] = [x for x in v if x["date"] >= str(since)]
-    _save(s)
-    log(f"[apify] {run['status']}: {posts_n} posts from {sum(bool(v) for v in got.values())}/{len(todo)} profiles, "
-        f"${cost:.3f} (month {spent_this_month():.2f}/{budget():.2f})")
+        left = credit_left()
+        if left is None:
+            left = budget() - spent_this_month()
+        if left < cap:  # not enough for the whole chunk -> as many profiles as the credit allows
+            part = part[:int(max(0.0, left - 0.02 - POSTS_START_USD) / (POST_USD * max_posts))]
+            if not part:
+                log(f"[apify] CREDIT FINISHED (${left:.2f} left on this key): {len(todo) - i} profiles not done. "
+                    f"Set a new APIFY_TOKEN and run again - finished profiles are cached and not paid twice.")
+                break
+            n = len(part) * max_posts
+            cap = max(0.05, round(POSTS_START_USD + POST_USD * n + 0.01, 3))
+        body = {"targetUrls": [_target(k) for k in part], "maxPosts": max_posts, "postedLimitDate": str(since),
+                "includeReposts": False, "includeQuotePosts": True, "scrapeReactions": False, "scrapeComments": False}
+        log(f"[apify] chunk {i // chunk + 1}/{-(-len(todo) // chunk)}: {len(part)} profiles, cap ${cap:.2f}, "
+            f"credit left ${left:.2f}")
+        try:
+            run, items = _run(POSTS_ACTOR, body, cap, n)
+        except (requests.RequestException, KeyError, ValueError) as e:
+            log(f"[apify] failed: {e} -> stopped; run again to continue")
+            break
+        got = {k: [] for k in part}
+        for it in items:
+            if not isinstance(it, dict) or it.get("type", "post") != "post":
+                continue
+            k = _slug((it.get("query") or {}).get("targetUrl", ""))
+            if k not in got:
+                a = it.get("author") or {}
+                k = ("company:" + (a.get("universalName") or "").lower()) if a.get("type") == "company"                     else (a.get("publicIdentifier") or "").lower()
+            if k in got:
+                got[k].append(_post(it))
+        posts_n = sum(len(v) for v in got.values())
+        cost = round(max(float(run.get("usageTotalUsd") or 0), POSTS_START_USD + POST_USD * posts_n), 4)
+        _charge(cost)
+        ok = run.get("status") == "SUCCEEDED"
+        s = _load()
+        for k, v in got.items():
+            v.sort(key=lambda x: x["date"], reverse=True)
+            out[k] = [x for x in v if x["date"] >= str(since)]
+            if v or ok:  # an empty result is only trusted from a run that finished normally
+                s.setdefault("profiles", {})[k] = {"date": today.isoformat(), "since": str(since), "posts": v}
+            elif not v:
+                out.pop(k)
+        _save(s)
+        log(f"[apify] {run.get('status')}: {posts_n} posts from {sum(bool(v) for v in got.values())}/{len(part)} "
+            f"profiles, ${cost:.3f}")
+        if not ok:
+            log("[apify] run did not finish normally (credit?) -> stopped; run again to continue")
+            break
     return out
